@@ -1,0 +1,74 @@
+name: Auto PR Info Extract on Merge
+
+on:
+  push:
+    branches:
+      - develop
+      - staging
+      - main
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  extract-info:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Detect PR number
+        id: pr
+        run: |
+          PR_NUM=""
+          MSG=$(git log -1 --pretty=%B)
+
+          if echo "$MSG" | grep -q "Merge pull request #[0-9]\+"; then
+            PR_NUM=$(echo "$MSG" | grep -o "Merge pull request #[0-9]\+" | grep -o "[0-9]\+")
+          else
+            PR_NUM=$(git log -10 --pretty=%B | grep -o '#[0-9]\+' | grep -o '[0-9]\+' | head -1 || true)
+          fi
+
+          echo "Detected PR: $PR_NUM"
+          echo "pr=$PR_NUM" >> $GITHUB_OUTPUT
+
+      - name: Extract deployment info (PR title + body)
+        id: extract
+        run: |
+          PR="${{ steps.pr.outputs.pr }}"
+
+          if [[ -z "$PR" ]]; then
+            echo "info=No PR found" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          DATA=$(curl -s \
+            -H "Authorization: token ${{ github.token }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ github.repository }}/pulls/$PR)
+
+          TITLE=$(echo "$DATA" | jq -r '.title')
+          BODY=$(echo "$DATA" | jq -r '.body // "No description"')
+
+          INFO="*PR #$PR:* $TITLE\n*Description:* ${BODY:0:300}"
+
+          DELIM="EOF_$(date +%s)"
+          echo "info<<$DELIM" >> $GITHUB_OUTPUT
+          echo -e "$INFO" >> $GITHUB_OUTPUT
+          echo "$DELIM" >> $GITHUB_OUTPUT
+
+      - name: Send Slack Notification
+        run: |
+          TEXT="Deployment Info:\n${{ steps.extract.outputs.info }}"
+          
+          curl -X POST \
+            -H 'Content-type: application/json' \
+            --data "{\"text\": \"${TEXT}\"}" \
+            "${{ secrets.SLACK_WEBHOOK_URL }}"
